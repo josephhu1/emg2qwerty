@@ -278,3 +278,112 @@ class TDSConvEncoder(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.tds_conv_blocks(inputs)  # (T, N, num_features)
+
+class TCNBlock(nn.Module):
+    """A single dilated causal convolution block with residual connection.
+    
+    'Causal' means we only look at past timesteps (no future leakage),
+    achieved by padding the left side only and trimming the right.
+    
+    For an input of shape (T, N, num_features):
+      1. Permute to (N, num_features, T) for Conv1d
+      2. Apply dilated conv with left-only padding
+      3. Trim excess right padding to restore original T
+      4. Apply ReLU + Dropout
+      5. Permute back to (T, N, num_features)
+      6. Add residual + LayerNorm
+    
+    Args:
+        num_features (int): Number of features (channels) at input and output.
+        kernel_size (int): Convolution kernel size.
+        dilation (int): Dilation factor. Layer i should use dilation=2**i.
+        dropout (float): Dropout probability after activation.
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        kernel_size: int,
+        dilation: int,
+        dropout: float = 0.2,
+    ) -> None:
+        super().__init__()
+
+        # Left-only (causal) padding: pad by (kernel_size-1)*dilation on the left
+        self.causal_padding = (kernel_size - 1) * dilation
+
+        self.conv = nn.Conv1d(
+            in_channels=num_features,
+            out_channels=num_features,
+            kernel_size=kernel_size,
+            dilation=dilation,
+            padding=self.causal_padding,  # we'll trim the right side in forward()
+        )
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+        self.layer_norm = nn.LayerNorm(num_features)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        x = inputs  # (T, N, num_features)
+
+        # Conv1d expects (N, C, T), so permute
+        x = x.permute(1, 2, 0)  # (N, num_features, T)
+
+        x = self.conv(x)
+
+        # Trim the extra right-side padding to restore original T length.
+        # Because we padded causal_padding on the left, conv output is
+        # (N, num_features, T + causal_padding). We remove the rightmost
+        # causal_padding elements to get back to (N, num_features, T).
+        if self.causal_padding > 0:
+            x = x[:, :, : -self.causal_padding]
+
+        x = self.relu(x)
+        x = self.dropout(x)
+
+        # Permute back to (T, N, num_features)
+        x = x.permute(2, 0, 1)
+
+        # Residual connection + LayerNorm (matching TDSConv style)
+        return self.layer_norm(x + inputs)
+
+
+class TCNEncoder(nn.Module):
+    """A Temporal Convolutional Network encoder composing a stack of
+    TCNBlock layers with exponentially increasing dilation factors.
+
+    The exponential dilation (2^0, 2^1, 2^2, ...) means each successive
+    layer doubles the receptive field. With num_layers=8 and kernel_size=16,
+    the total receptive field is (kernel_size - 1) * (2^num_layers - 1) + 1
+    = 15 * 255 + 1 = 3826 timesteps, covering ~1.9 seconds of EMG at 2kHz.
+
+    Args:
+        num_features (int): num_features for an input of shape (T, N, num_features).
+        num_layers (int): Number of TCNBlock layers (default: 8).
+        kernel_size (int): Kernel size for each dilated convolution (default: 16).
+        dropout (float): Dropout probability (default: 0.2).
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        num_layers: int = 8,
+        kernel_size: int = 16,
+        dropout: float = 0.2,
+    ) -> None:
+        super().__init__()
+
+        self.blocks = nn.Sequential(
+            *[
+                TCNBlock(
+                    num_features=num_features,
+                    kernel_size=kernel_size,
+                    dilation=2**i,  # exponential dilation: 1, 2, 4, 8, 16, ...
+                    dropout=dropout,
+                )
+                for i in range(num_layers)
+            ]
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.blocks(inputs)  # (T, N, num_features)
