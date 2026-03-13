@@ -278,3 +278,36 @@ class TDSConvEncoder(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.tds_conv_blocks(inputs)  # (T, N, num_features)
+    
+class FastSpectroRNN(nn.Module):
+    def __init__(self, in_features=528, hidden_size=256, num_classes=32, num_layers=2, dropout=0.2): 
+        super().__init__()
+        
+        self.conv = nn.Conv1d(
+            in_channels=in_features, out_channels=hidden_size, 
+            kernel_size=5, stride=2, padding=2
+        )
+        self.bn = nn.BatchNorm1d(hidden_size)
+        self.relu = nn.ReLU()
+        
+        self.rnn = nn.GRU(
+            input_size=hidden_size, 
+            hidden_size=hidden_size, 
+            num_layers=num_layers, 
+            batch_first=True, 
+            bidirectional=True, 
+            dropout=dropout
+        )
+        self.classifier = nn.Linear(hidden_size * 2, num_classes)
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.relu(x)
+        
+        x = x.permute(0, 2, 1)
+        
+        x, _ = self.rnn(x)
+        logits = self.classifier(x)
+        return logits

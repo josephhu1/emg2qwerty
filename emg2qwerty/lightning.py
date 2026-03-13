@@ -28,6 +28,9 @@ from emg2qwerty.modules import (
 )
 from emg2qwerty.transforms import Transform
 
+from .modules import FastSpectroRNN
+import torch.nn.functional as F
+
 
 class WindowedEMGDataModule(pl.LightningDataModule):
     def __init__(
@@ -269,3 +272,100 @@ class TDSConvCTCModule(pl.LightningModule):
             optimizer_config=self.hparams.optimizer,
             lr_scheduler_config=self.hparams.lr_scheduler,
         )
+
+class FastSpectroRNNCTCModule(TDSConvCTCModule):
+    def __init__(
+        self, 
+        in_features=528, 
+        hidden_size=256, 
+        num_layers=2,
+        dropout=0.2,
+        **kwargs
+    ):
+        # Inject required baseline kwargs
+        kwargs.setdefault("mlp_features", [384])
+        kwargs.setdefault("block_channels", [24, 24, 24, 24])
+        kwargs.setdefault("kernel_width", 32)
+        
+        # 1. Build the parent's full baseline CNN
+        super().__init__(in_features=in_features, **kwargs)
+        
+        # 2. Rescue the preprocessing layers before destroying the baseline CNN
+        self.spec_norm = self.model[0]
+        self.mlp = self.model[1]
+        self.flatten = self.model[2]
+        
+        # 3. Overwrite the baseline CNN with our custom RNN
+        from .modules import FastSpectroRNN
+        rnn_in_features = self.NUM_BANDS * kwargs["mlp_features"][-1]
+        
+        self.model = FastSpectroRNN(
+            in_features=rnn_in_features, 
+            hidden_size=hidden_size, 
+            num_classes=charset().num_classes,
+            num_layers=num_layers,
+            dropout=dropout
+        )
+        self.save_hyperparameters()
+
+    def forward(self, x):
+        # Apply rescued preprocessing: 5D -> 3D tensor
+        x = self.spec_norm(x)
+        x = self.mlp(x)
+        x = self.flatten(x)  # Shape: (Time, Batch, Features)
+        
+        # Swap batch and time for our RNN: (Batch, Time, Features)
+        x = x.transpose(0, 1)  
+        
+        # Pass through custom RNN
+        logits = self.model(x)
+
+        # Apply Log-Softmax for the CTC Loss
+        lop_probs = F.log_softmax(logits, dim=-1)
+        
+        # Convert back to (Time, Batch, Classes) for CTC Loss
+        return lop_probs.permute(1, 0, 2)
+
+    # def _step(self, phase, batch, *args, **kwargs):
+    #     # Downsample lengths for CTC loss due to Conv1d stride=2
+    #     batch["input_lengths"] = (batch["input_lengths"] - 1) // 2 + 1
+    #     return super()._step(phase, batch, *args, **kwargs)
+
+    def _step(self, phase: str, batch: dict[str, torch.Tensor], *args, **kwargs) -> torch.Tensor:
+        inputs = batch["inputs"]
+        targets = batch["targets"]
+        input_lengths = batch["input_lengths"]
+        target_lengths = batch["target_lengths"]
+        N = len(input_lengths)
+
+        # 1. Get model predictions
+        emissions = self.forward(inputs)
+
+        # 2. OUR FIX: Exact length calculation for Conv1d with stride=2, padding=2
+        emission_lengths = (input_lengths - 1) // 2 + 1
+
+        # 3. Calculate CTC Loss
+        loss = self.ctc_loss(
+            log_probs=emissions,
+            targets=targets.transpose(0, 1),
+            input_lengths=emission_lengths,
+            target_lengths=target_lengths,
+        )
+
+        # 4. Decode for CER calculation (Validation/Testing only)
+        predictions = self.decoder.decode_batch(
+            emissions=emissions.detach().cpu().numpy(),
+            emission_lengths=emission_lengths.detach().cpu().numpy(),
+        )
+
+        # 5. Update Metrics
+        metrics = self.metrics[f"{phase}_metrics"]
+        targets = targets.detach().cpu().numpy()
+        target_lengths = target_lengths.detach().cpu().numpy()
+        
+        for i in range(N):
+            target = LabelData.from_labels(targets[: target_lengths[i], i])
+            metrics.update(prediction=predictions[i], target=target)
+
+        self.log(f"{phase}/loss", loss, batch_size=N, sync_dist=True)
+        return loss
