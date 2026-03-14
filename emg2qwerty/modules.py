@@ -278,3 +278,42 @@ class TDSConvEncoder(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.tds_conv_blocks(inputs)  # (T, N, num_features)
+
+
+class TransformerEncoder(nn.Module):
+    """A Transformer encoder that takes (T, N, num_features) and outputs
+    (T, N, num_features). Drop-in replacement for TDSConvEncoder for
+    architecture comparison."""
+
+    def __init__(
+        self,
+        num_features: int,
+        nhead: int = 8,
+        num_layers: int = 4,
+        dim_feedforward: int = 2048,
+        dropout: float = 0.1,
+        max_len: int = 16000,
+    ) -> None:
+        super().__init__()
+        self.num_features = num_features
+        self.max_len = max_len
+
+        self.pos_embedding = nn.Parameter(torch.randn(1, max_len, num_features) * 0.02)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=num_features,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=False,
+            norm_first=False,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        T, N, C = inputs.shape
+        assert T <= self.max_len, f"Sequence length {T} exceeds max_len {self.max_len}"
+
+        pos = self.pos_embedding[:, :T, :].transpose(0, 1)
+        x = inputs + pos
+        return self.transformer(x)
